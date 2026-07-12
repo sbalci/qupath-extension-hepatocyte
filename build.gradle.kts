@@ -1,0 +1,119 @@
+/*
+ * QuPath Hepatocyte extension — packages the hepatocyte-app segmentation
+ * workflow as one-click menu items under Extensions → Hepatocyte.
+ *
+ * Build:    ./gradlew clean build
+ * Output:   build/libs/qupath-extension-hepatocyte-<version>.jar
+ * Install:  drag the .jar onto QuPath's main window → restart QuPath
+ *
+ * Reference: https://github.com/qupath/qupath-extension-template
+ */
+
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+
+plugins {
+    java
+    `java-library`
+    // JavaFX modules (controls/graphics) — needed at compile time because
+    // QuPath's GUI APIs return JavaFX types. JavaFX is bundled with QuPath
+    // at runtime, so we keep this as compileOnly via the plugin's defaults.
+    id("org.openjfx.javafxplugin") version "0.1.0"
+}
+
+group = "io.github.sbalci"
+version = "0.1.0"
+description = "QuPath extension for the hepatocyte-app deep-learning liver segmentation model — one menu."
+
+java {
+    toolchain {
+        // QuPath 0.6.0 is compiled for Java 21
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+    // SciJava hosts QuPath release and snapshot artifacts
+    maven {
+        url = uri("https://maven.scijava.org/content/repositories/releases")
+    }
+    maven {
+        url = uri("https://maven.scijava.org/content/repositories/snapshots")
+    }
+}
+
+val qupathVersion = "0.6.0"
+
+javafx {
+    // Compile against JavaFX 21 (LTS) — at or below the JavaFX that QuPath 0.6.0
+    // (the baseline floor) ships, so we never reference an API newer than the
+    // runtime provides. JavaFX is compileOnly (QuPath supplies it at runtime),
+    // so this only bounds the compile classpath; compiling older-than-runtime
+    // stays forward-compatible.
+    version = "21"
+    modules("javafx.controls", "javafx.graphics", "javafx.fxml")
+    configuration = "compileOnly"
+}
+
+dependencies {
+    // QuPath APIs — provided by the host application at runtime
+    compileOnly("io.github.qupath:qupath-gui-fx:$qupathVersion")
+    compileOnly("io.github.qupath:qupath-core:$qupathVersion")
+
+    // qupath-fxtras: Dialogs + FileChoosers used by the Java settings/about UI.
+    // gui-fx pulls it as a RUNTIME dependency, so it isn't on our compile
+    // classpath — declare it compileOnly (QuPath supplies it at runtime; we
+    // must NOT bundle it). Version pinned to what QuPath 0.6.0 ships.
+    compileOnly("io.github.qupath:qupath-fxtras:0.2.0")
+
+    // Groovy — bundled with QuPath, so compileOnly (used to evaluate the
+    // bundled workflow scripts through a GroovyShell at click time)
+    compileOnly("org.apache.groovy:groovy:4.0.21")
+
+    // Logging — QuPath provides slf4j
+    compileOnly("org.slf4j:slf4j-api:2.0.13")
+}
+
+tasks.compileJava {
+    options.encoding = "UTF-8"
+}
+
+tasks.processResources {
+    filteringCharset = "UTF-8"
+}
+
+// Generates build-info.properties fresh on every build (timestamp computed at
+// execution time, so it isn't frozen into Gradle's configuration cache).
+// Output is placed under build/generated/build-info and added to the main
+// resources so it ends up at the root of the JAR.
+val generateBuildInfo = tasks.register("generateBuildInfo") {
+    val outDir = layout.buildDirectory.dir("generated/build-info")
+    val ver = project.version.toString()
+    outputs.dir(outDir)
+    outputs.upToDateWhen { false }
+    doLast {
+        val ts = ZonedDateTime
+            .now(ZoneId.of("Europe/Istanbul"))
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'TRT'"))
+        val file = outDir.get().file("build-info.properties").asFile
+        file.parentFile.mkdirs()
+        file.writeText("build.timestamp=$ts\nbuild.version=$ver\n", Charsets.UTF_8)
+    }
+}
+
+sourceSets.main {
+    resources.srcDir(generateBuildInfo.map { it.outputs.files })
+}
+
+tasks.jar {
+    archiveBaseName.set("qupath-extension-hepatocyte")
+    manifest {
+        attributes(
+            "Implementation-Title"   to "QuPath Hepatocyte Extension",
+            "Implementation-Version" to project.version,
+            "Automatic-Module-Name"  to "io.github.sbalci.qupath.hepatocyte"
+        )
+    }
+}

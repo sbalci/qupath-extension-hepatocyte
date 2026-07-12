@@ -1,0 +1,54 @@
+{
+  "title": "QuPath Hepatocyte Extension: run the hepatocyte-app liver segmentation model on QuPath annotations",
+  "description": "<p>A <strong>QuPath 0.6+ extension</strong> that packages the <a href=\"https://github.com/sbalci/hepatocyte-app\">hepatocyte-app</a> deep-learning liver H&amp;E segmentation workflow as one-click menu entries under <strong>Extensions &rarr; Hepatocyte</strong>.</p><p><strong>Menu items:</strong> (1) import slides from a folder into the project and set them to brightfield H&amp;E; (2) run the TorchScript segmentation model on the selected area annotation(s). Inference runs <em>outside</em> QuPath: the extension writes a request JSON, calls the repo's Python bridge (<code>hepatocyte_qupath_inference.py</code>) in the project's venv, and imports the returned GeoJSON polygons back as classified QuPath annotations with per-class cell-count measurements and an optional Excel report.</p><p>The model emits five morphological classes (Balloon dystrophy, Mesenchymal, Non-nuclear, Normal, Steatosis). It produces a deep-learning prediction that must be verified visually; no clinical grade or score (NAS/SAF/fibrosis) is derived.</p><p><strong>Requires</strong> a local checkout of hepatocyte-app with its Python venv and the TorchScript model checkpoint (🔒 available on request); paths are configured in the extension's Settings dialog.</p><p><strong>Scope:</strong> research and education only.</p>",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Balcı, Serdar",
+      "affiliation": "Memorial Pathology, Istanbul, Turkey",
+      "orcid": "0000-0002-7852-3851"
+    }
+  ],
+  "license": "Apache-2.0",
+  "access_right": "open",
+  "language": "eng",
+  "keywords": [
+    "QuPath",
+    "digital pathology",
+    "computational pathology",
+    "liver histopathology",
+    "hepatocyte",
+    "steatosis",
+    "whole slide image",
+    "WSI",
+    "deep learning",
+    "segmentation",
+    "TorchScript",
+    "Groovy"
+  ],
+  "communities": [
+    {"identifier": "qupath"}
+  ],
+  "related_identifiers": [
+    {
+      "scheme": "url",
+      "identifier": "https://github.com/sbalci/hepatocyte-app",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    },
+    {
+      "scheme": "url",
+      "identifier": "https://github.com/sbalci/qupath-extension-hepatocyte",
+      "relation": "isSourceOf",
+      "resource_type": "software"
+    },
+    {
+      "scheme": "doi",
+      "identifier": "10.1038/s41598-017-17204-5",
+      "relation": "references",
+      "resource_type": "publication-article"
+    }
+  ],
+  "contributors": [],
+  "notes": "Packaging + distribution layer for the hepatocyte-app QuPath workflow. The model runs outside QuPath via the repo's Python bridge; the TorchScript checkpoint is available on request. Research and education only."
+}

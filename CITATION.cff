@@ -1,0 +1,53 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using this metadata."
+title: "QuPath Hepatocyte Extension: run the hepatocyte-app liver segmentation model on QuPath annotations"
+abstract: >
+  A QuPath 0.6+ extension that packages the sbalci/hepatocyte-app deep-learning
+  liver H&E segmentation workflow as one-click menu entries under
+  "Extensions → Hepatocyte". It imports slides into a project and runs the
+  TorchScript segmentation model on selected area annotations via the repo's
+  Python bridge (hepatocyte_qupath_inference.py), importing predictions back as
+  classified polygons with per-class cell counts and an optional Excel report.
+  The model emits five morphological classes (Balloon dystrophy, Mesenchymal,
+  Non-nuclear, Normal, Steatosis); no clinical grade or score is derived.
+  Research and education only.
+type: software
+authors:
+  - family-names: "Balcı"
+    given-names: "Serdar"
+    email: "drserdarbalci@gmail.com"
+    affiliation: "Memorial Pathology, Istanbul, Turkey"
+    orcid: "https://orcid.org/0000-0002-7852-3851"
+license: Apache-2.0
+version: "0.1.0"
+date-released: "2026-07-12"
+repository-code: "https://github.com/sbalci/qupath-extension-hepatocyte"
+url: "https://github.com/sbalci/hepatocyte-app"
+keywords:
+  - "QuPath"
+  - "digital pathology"
+  - "computational pathology"
+  - "liver histopathology"
+  - "hepatocyte"
+  - "steatosis"
+  - "whole slide image"
+  - "WSI"
+  - "deep learning"
+  - "segmentation"
+  - "Groovy"
+references:
+  - type: software
+    title: "QuPath: Open source software for digital pathology image analysis"
+    authors:
+      - family-names: "Bankhead"
+        given-names: "Peter"
+    doi: "10.1038/s41598-017-17204-5"
+    year: 2017
+    notes: "Underlying platform — required citation for any QuPath-based work"
+  - type: software
+    title: "hepatocyte-app: deep-learning pipeline for liver histopathology WSI segmentation and cell morphometry"
+    authors:
+      - family-names: "Balcı"
+        given-names: "Serdar"
+    repository-code: "https://github.com/sbalci/hepatocyte-app"
+    notes: "The segmentation model and Python inference bridge this extension drives"
