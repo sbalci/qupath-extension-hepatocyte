@@ -2,34 +2,24 @@
  * run-inference.groovy — Hepatocyte segmentation (single-window wizard)
  * ---------------------------------------------------------------------
  * Bundled in qupath-extension-hepatocyte; launched from
- * Extensions → Hepatocyte → "2. Run inference on selected annotations".
+ * Extensions → Hepatocyte → "2. Run inference on selected annotations…".
  *
  * WHAT IT DOES:
  *   Runs the hepatocyte-app deep-learning (TorchScript) model on the selected
- *   area annotation(s) — a real example of "run your own model in QuPath":
- *     1. Writes each selected/area annotation's level-0 coordinates + WKT
+ *   area annotation(s) (or all non-prediction area annotations on the slide if
+ *   none is explicitly selected):
+ *     1. Writes each candidate area annotation's level-0 coordinates + WKT
  *        geometry to a request JSON.
  *     2. Runs hepatocyte-app's `hepatocyte_qupath_inference.py` in a Python venv
  *        (OUTSIDE QuPath); the bridge opens the slide with openslide, runs the
- *        model, and returns polygons as GeoJSON.
- *     3. Imports the GeoJSON back as classified QuPath annotations and writes a
- *        per-class cell count measurement to each parent ROI. If a project is
- *        open, an Excel report is written under <project>/reports/<slide>/.
+ *        model with MPP-aware scaling, separates touching cells via Watershed,
+ *        and returns cell polygons as GeoJSON.
+ *     3. Imports the GeoJSON back as classified QuPath annotations and writes
+ *        per-class cell count measurements (`Hepatocyte: <class>` and
+ *        `Hepatocyte: total`) to each parent ROI. If a project is open, an
+ *        Excel report is written under `<project>/reports/<slide>/`.
  *
- * CONFIGURATION (Extensions → Hepatocyte → Settings…, or the Configure button):
- *   • Python  — python(.exe) of the hepatocyte-app venv
- *   • Bridge  — <repo>/qupath/hepatocyte_qupath_inference.py
- *   • Model   — TorchScript checkpoint (.pth, 🔒 on request)
- *   Settings persist in a java.util.prefs node shared with the Java UI.
- *
- * WHAT IT MEASURES (and does NOT):
- *   • Classes are the MODEL's morphological classes (Balloon dystrophy,
- *     Mesenchymal, Non-nuclear, Normal, Steatosis); no clinical grade/score
- *     (NAS/SAF/fibrosis) is derived.
- *   • Output is classified polygons + per-class counts only. It is a DEEP
- *     LEARNING PREDICTION — verify visually.
- *
- * ⚠️ Research/education only. Not for clinical decision-making.
+ * ⚠️ Research and education use only. Not for clinical decision-making.
  */
 
 import qupath.fx.dialogs.Dialogs
@@ -47,6 +37,11 @@ def isHeadless = gui == null
 long PYTHON_TIMEOUT_SECONDS = 1800L          // WSI region inference — generous ceiling
 def MONO = "-fx-font-family: 'Consolas', 'Menlo', 'Courier New', monospace; -fx-font-size: 12px;"
 def DEVICE_OPTIONS = ['auto', 'cpu', 'cuda']
+def PREDICTION_CLASSES = ['Balloon dystrophy', 'Mesenchymal', 'Non-nuclear', 'Normal', 'Steatosis'] as Set
+
+def HEPATO_REPO_ZIP   = 'https://github.com/sbalci/hepatocyte-app/archive/refs/heads/main.zip'
+def HEPATO_ZIP_TOP    = 'hepatocyte-app-main'
+def HEPATO_BRIDGE_SUB = 'qupath/hepatocyte_qupath_inference.py'
 
 // ── Persistent config: java.util.prefs (MUST match HepatocyteConfig.NODE) ────
 def prefs = java.util.prefs.Preferences.userRoot().node('io/github/sbalci/qupath/hepatocyte')
@@ -58,6 +53,12 @@ def PREF_PATCH   = 'patch'
 def PREF_MINAREA = 'minArea'
 def PREF_MINROI  = 'minRoi'
 def PREF_MPP     = 'targetMpp'
+
+// Auto-detect standard hepatocyte-app locations if paths are unset
+try {
+    Class.forName('io.github.sbalci.qupath.hepatocyte.HepatocyteConfig')
+        .getMethod('autoDetectIfNeeded').invoke(null)
+} catch (Throwable ignore) {}
 
 def loadConfig = { ->
     [ python    : prefs.get(PREF_PYTHON,  ''),
@@ -73,15 +74,15 @@ def loadConfig = { ->
 // Required: python(.exe) + bridge script + model weights
 def configMissing = { cfg ->
     def miss = []
-    if (!cfg.python?.trim() || !(new File(cfg.python)).isFile()) miss << 'Python executable (python.exe)'
-    if (!cfg.bridge?.trim() || !(new File(cfg.bridge)).isFile()) miss << 'Bridge script (hepatocyte_qupath_inference.py)'
-    if (!cfg.model?.trim()  || !(new File(cfg.model)).isFile())  miss << 'Model weights (.pth — 🔒 on request)'
+    if (!cfg.python?.trim() || !(new File(cfg.python)).isFile()) miss << 'Python executable (venv python.exe)'
+    if (!cfg.bridge?.trim() || !(new File(cfg.bridge)).isFile()) miss << 'Bridge script (qupath/hepatocyte_qupath_inference.py)'
+    if (!cfg.model?.trim()  || !(new File(cfg.model)).isFile())  miss << 'Model weights (.pth — 🔒 available on request)'
     return miss
 }
 def configComplete = { cfg -> configMissing(cfg).isEmpty() }
 
 def parseIntOr = { s, int d -> try { return Integer.parseInt((s ?: '').toString().trim()) } catch (Throwable t) { return d } }
-def parseDoubleOr = { s, double d -> try { return Double.parseDouble((s ?: '').toString().trim()) } catch (Throwable t) { return d } }
+def parseDoubleOr = { s, double d -> try { return Double.parseDouble((s ?: '').toString().replace(',', '.').trim()) } catch (Throwable t) { return d } }
 
 // ── Resolve slide path (local file only; Python opens it with openslide) ─────
 def resolveSlidePath = { imageData ->
@@ -94,7 +95,7 @@ def resolveSlidePath = { imageData ->
     def sp = null
     try { sp = server.getPath() } catch (Throwable ignore) {}
     if (sp != null) {
-        def m = (~"file:/+(.+?\\.svs|.+?\\.tiff?|.+?\\.ndpi|.+?\\.png)\$").matcher(sp)
+        def m = (~"file:/+(.+?\\.(?:svs|tiff?|ndpi|mrxs|scn|bif|vms|vmu|png))\$").matcher(sp)
         if (m.find()) {
             try { return java.net.URLDecoder.decode(m.group(1), 'UTF-8').replace('/', File.separator) } catch (Throwable ignore) {}
         }
@@ -107,11 +108,17 @@ def imageNameOf = { imageData ->
     return nm.replaceAll(/\.[^.\/\\]+$/, '')
 }
 
-// Target area annotations: selected ones if any, else all area annotations.
+def isCandidateAnnotation = { ann ->
+    if (ann == null || !ann.isAnnotation() || !ann.hasROI() || !ann.getROI().isArea()) return false
+    def cls = ann.getPathClass()
+    return cls == null || !PREDICTION_CLASSES.contains(cls.toString())
+}
+
+// Target area annotations: selected candidate ones if any, else all candidate area annotations.
 def targetAnnotations = { imageData ->
-    def sel = QP.getSelectedObjects().findAll { it.isAnnotation() && it.hasROI() && it.getROI().isArea() }
+    def sel = QP.getSelectedObjects().findAll { isCandidateAnnotation(it) }
     if (!sel.isEmpty()) return sel
-    return imageData.getHierarchy().getAnnotationObjects().findAll { it.hasROI() && it.getROI().isArea() }
+    return imageData.getHierarchy().getAnnotationObjects().findAll { isCandidateAnnotation(it) }
 }
 
 // ── Build request JSON (level-0 coords + WKT) ────────────────────────────────
@@ -160,7 +167,6 @@ def importResult = { File outputFile, imageData, List targetAnns ->
         imageData.getHierarchy().addObjects(imported)
         QP.fireHierarchyUpdate()
     }
-    // metadata.counts_per_roi → per-ROI measurements + grand totals
     def countsPerRoi = [:]
     def classTotals = new TreeMap<String, Integer>()
     try {
@@ -218,7 +224,7 @@ def buildResultText = { slideName, exp, imp, File reportFile ->
     if (reportFile != null && reportFile.isFile())
         sb << "Excel report: " << reportFile.getAbsolutePath() << "\n"
     sb << "\nOutput is a deep-learning prediction — verify visually.\n"
-    sb << "⚠️ Research/education only."
+    sb << "⚠️ Research and education only."
     return sb.toString()
 }
 
@@ -232,14 +238,13 @@ if (isHeadless) {
     if (!miss.isEmpty()) println "Missing config: ${miss.join(', ')}"
     def sp = resolveSlidePath(imageData)
     println "Slide path: ${sp ?: '(not a local file — openslide cannot open it)'}"
-    println "Area annotations: ${targetAnnotations(imageData).size()}"
-    println "This wizard needs the QuPath GUI (cannot run headless)."
-    println "⚠️ Research/education only."
+    println "Candidate area annotations: ${targetAnnotations(imageData).size()}"
+    println "This wizard requires the QuPath GUI."
+    println "⚠️ Research and education only."
     return
 }
 
 // ── State-machine fields ──────────────────────────────────────────────────────
-// CONFIG_INCOMPLETE | CONFIG | CHECK_RUNNING | CHECK_DONE | READY | RUN_RUNNING | BUSY | RESULT | ERROR
 def stage = null
 def step          = new java.util.concurrent.atomic.AtomicReference('READY')
 def alwaysTop     = new java.util.concurrent.atomic.AtomicBoolean(true)
@@ -274,6 +279,95 @@ def copyToClipboard = { String txt ->
     def content = new javafx.scene.input.ClipboardContent(); content.putString(txt ?: ""); cb.setContent(content)
 }
 
+// ── Helper: Select hepatocyte-app folder to auto-fill paths ──────────────────
+def pickRepoFolder = { ->
+    def dc = new javafx.stage.DirectoryChooser()
+    dc.setTitle('Select your hepatocyte-app repository folder')
+    def chosen = dc.showDialog(stage)
+    if (chosen != null && chosen.isDirectory()) {
+        try {
+            def msg = Class.forName('io.github.sbalci.qupath.hepatocyte.HepatocyteConfig')
+                .getMethod('applyRepoRoot', File.class, boolean.class)
+                .invoke(null, chosen, true)
+            def cfg = loadConfig()
+            if (pyFieldRef.get() != null) pyFieldRef.get().setText(cfg.python ?: '')
+            if (bridgeFieldRef.get() != null) bridgeFieldRef.get().setText(cfg.bridge ?: '')
+            if (modelFieldRef.get() != null) modelFieldRef.get().setText(cfg.model ?: '')
+            Dialogs.showMessageDialog('Auto-fill from folder', msg.toString())
+            step.set(configComplete(cfg) ? 'READY' : 'CONFIG')
+            render()
+        } catch (Throwable t) {
+            Dialogs.showErrorMessage('Auto-fill error', t.getMessage() ?: t.getClass().getSimpleName())
+        }
+    }
+}
+
+// ── Helper: Download bridge from GitHub (no git required) ────────────────────
+def downloadBridgeFromGitHub = { ->
+    busyLabelRef.set('Downloading hepatocyte-app bridge from GitHub…')
+    step.set('BUSY'); render()
+    def worker = new Thread({
+        try {
+            def baseDir = new File(new File(System.getProperty('user.home'), '.hepatocyte-app'), 'repo')
+            baseDir.mkdirs()
+            def zipFile = new File(baseDir, 'hepatocyte-app-main.zip')
+            String curUrl = HEPATO_REPO_ZIP
+            int hops = 0
+            while (true) {
+                if (hops++ > 8) throw new RuntimeException('Too many HTTP redirects')
+                def u = new java.net.URL(curUrl)
+                def conn = (java.net.HttpURLConnection) u.openConnection()
+                conn.setInstanceFollowRedirects(false)
+                conn.setConnectTimeout(30000); conn.setReadTimeout(120000)
+                conn.setRequestProperty('User-Agent', 'qupath-extension-hepatocyte')
+                int code = conn.getResponseCode()
+                if (code >= 300 && code < 400) {
+                    def loc = conn.getHeaderField('Location'); conn.disconnect()
+                    curUrl = new java.net.URL(u, loc).toString(); continue
+                }
+                if (code != 200) { conn.disconnect(); throw new RuntimeException('HTTP ' + code) }
+                conn.getInputStream().withCloseable { ins ->
+                    new java.io.FileOutputStream(zipFile).withCloseable { out -> ins.transferTo(out) }
+                }
+                conn.disconnect()
+                break
+            }
+            def zf = new java.util.zip.ZipFile(zipFile)
+            try {
+                def rootCanonical = baseDir.getCanonicalPath() + File.separator
+                def entries = zf.entries()
+                while (entries.hasMoreElements()) {
+                    def e = entries.nextElement()
+                    def outF = new File(baseDir, e.getName())
+                    if (!outF.getCanonicalPath().startsWith(rootCanonical)) continue
+                    if (e.isDirectory()) { outF.mkdirs() }
+                    else {
+                        outF.getParentFile()?.mkdirs()
+                        zf.getInputStream(e).withCloseable { ins ->
+                            new java.io.FileOutputStream(outF).withCloseable { out -> ins.transferTo(out) }
+                        }
+                    }
+                }
+            } finally { zf.close(); zipFile.delete() }
+            def bridgeFile = new File(new File(baseDir, HEPATO_ZIP_TOP), HEPATO_BRIDGE_SUB)
+            if (!bridgeFile.isFile()) throw new RuntimeException('Bridge script not found in archive: ' + bridgeFile.getAbsolutePath())
+            prefs.put(PREF_BRIDGE, bridgeFile.getAbsolutePath())
+            try { prefs.flush() } catch (Throwable ignore) {}
+            javafx.application.Platform.runLater {
+                Dialogs.showMessageDialog('Bridge downloaded', 'Saved bridge script to:\n' + bridgeFile.getAbsolutePath())
+                step.set(configComplete(loadConfig()) ? 'READY' : 'CONFIG')
+                render()
+            }
+        } catch (Throwable t) {
+            javafx.application.Platform.runLater {
+                errorTextRef.set('Could not download bridge from GitHub:\n' + (t.getMessage() ?: t.getClass().getSimpleName()))
+                step.set('ERROR'); render()
+            }
+        }
+    }, 'Hepatocyte-DownloadBridge')
+    worker.setDaemon(true); worker.start()
+}
+
 // ── Python process (ProcessBuilder) → line stream ────────────────────────────
 def runPython = { List cmd, Closure onLine ->
     def pb = new ProcessBuilder(cmd); pb.redirectErrorStream(true)
@@ -301,13 +395,14 @@ def runPython = { List cmd, Closure onLine ->
     return [ok: (code == 0), exitCode: code, lastLines: last.join('\n')]
 }
 
-// Dependency + model check (no selftest subcommand → inline -c). Model path is a
-// SEPARATE argv (no quoting/backslash issues; ProcessBuilder never hits cmd.exe).
+// Dependency + model check
 def selftestCmd = { cfg ->
     def code = 'import sys, os; import numpy, pandas, torch, cv2, openslide, albumentations, openpyxl, shapely; from PIL import Image; ' +
+        'print("Python:", sys.executable); ' +
+        'print("PyTorch:", torch.__version__, "CUDA:", torch.cuda.is_available()); ' +
         'print("deps OK"); ' +
         'm = sys.argv[1] if len(sys.argv) > 1 else ""; ' +
-        'torch.jit.load(m, map_location="cpu") if (m and os.path.isfile(m)) else print("model UNSET (deps verified only)"); ' +
+        'torch.jit.load(m, map_location="cpu") if (m and os.path.isfile(m)) else print("model UNSET (dependencies verified only)"); ' +
         'print("SELFTEST OK")'
     return [cfg.python, '-c', code, (cfg.model ?: '')]*.toString()
 }
@@ -315,14 +410,15 @@ def selftestCmd = { cfg ->
 // ── Write CONFIG fields to prefs ─────────────────────────────────────────────
 def textOf = { ref -> def f = ref.get(); return (f != null ? f.getText() : '').trim() }
 def persistFields = {
-    prefs.put(PREF_PYTHON, textOf(pyFieldRef))
-    prefs.put(PREF_BRIDGE, textOf(bridgeFieldRef))
-    prefs.put(PREF_MODEL,  textOf(modelFieldRef))
-    def dv = deviceChoiceRef.get(); prefs.put(PREF_DEVICE, (dv != null && dv.getValue() != null) ? dv.getValue().toString() : 'auto')
-    prefs.put(PREF_PATCH,   textOf(patchFieldRef)   ?: '512')
-    prefs.put(PREF_MINAREA, textOf(minAreaFieldRef) ?: '15')
-    prefs.put(PREF_MINROI,  textOf(minRoiFieldRef)  ?: '512')
-    prefs.put(PREF_MPP,     textOf(mppFieldRef)     ?: '0.25')
+    if (pyFieldRef.get() != null)     prefs.put(PREF_PYTHON,  textOf(pyFieldRef))
+    if (bridgeFieldRef.get() != null) prefs.put(PREF_BRIDGE,  textOf(bridgeFieldRef))
+    if (modelFieldRef.get() != null)  prefs.put(PREF_MODEL,   textOf(modelFieldRef))
+    def dv = deviceChoiceRef.get()
+    if (dv != null && dv.getValue() != null) prefs.put(PREF_DEVICE, dv.getValue().toString())
+    if (patchFieldRef.get() != null)   prefs.put(PREF_PATCH,   textOf(patchFieldRef)   ?: '512')
+    if (minAreaFieldRef.get() != null) prefs.put(PREF_MINAREA, textOf(minAreaFieldRef) ?: '15')
+    if (minRoiFieldRef.get() != null)  prefs.put(PREF_MINROI,  textOf(minRoiFieldRef)  ?: '512')
+    if (mppFieldRef.get() != null)     prefs.put(PREF_MPP,     (textOf(mppFieldRef) ?: '0.25').replace(',', '.'))
     try { prefs.flush() } catch (Throwable ignore) {}
 }
 
@@ -373,7 +469,7 @@ def startRun = {
 
     def built = buildRequest(imageData, slidePath, cfg, reportFile)
     if (built.nRois == 0) {
-        errorTextRef.set('No area annotation to segment, or all are too small (bbox < ' + cfg.minRoi + ' px = one patch).\nDraw at least one area annotation ≥ ' + cfg.minRoi + '×' + cfg.minRoi + ' px.'); step.set('ERROR'); render(); return
+        errorTextRef.set('No candidate area annotation to segment, or all are too small (bbox < ' + cfg.minRoi + ' px = one patch).\nDraw at least one area annotation ≥ ' + cfg.minRoi + '×' + cfg.minRoi + ' px (or run 4. Auto-detect tissue).'); step.set('ERROR'); render(); return
     }
     def targetAnns = targetAnnotations(imageData)
     try { writeJson(built.request, requestFile) }
@@ -386,7 +482,7 @@ def startRun = {
     def worker = new Thread({
         def appendLine = { String ln -> javafx.application.Platform.runLater { def a = logAreaRef.get(); if (a != null) a.appendText(ln + '\n') } }
         appendLine('Slide: ' + slidePath)
-        appendLine('ROIs: ' + built.nRois + (built.skippedSmall > 0 ? ('  (skipped small: ' + built.skippedSmall + ')') : ''))
+        appendLine('ROIs : ' + built.nRois + (built.skippedSmall > 0 ? ('  (skipped small: ' + built.skippedSmall + ')') : ''))
         def cmd = [cfg.python, cfg.bridge, requestFile.getAbsolutePath(), outputFile.getAbsolutePath()]*.toString()
         def r = runPython(cmd, appendLine)
         if (!r.ok) {
@@ -394,6 +490,7 @@ def startRun = {
         }
         javafx.application.Platform.runLater { busyLabelRef.set('Importing results into QuPath…'); step.set('BUSY'); render() }
         def imp = importResult(outputFile, QP.getCurrentImageData(), targetAnns)
+        try { requestFile.delete(); outputFile.delete() } catch (Throwable ignore) {}
         javafx.application.Platform.runLater {
             try { gui.getViewer()?.repaintEntireImage() } catch (Throwable ignore) {}
             if (!imp.ok) { errorTextRef.set(imp.error); step.set('ERROR'); render() }
@@ -412,7 +509,7 @@ render = { ->
     def cfg = loadConfig()
 
     def title = new javafx.scene.control.Label()
-    title.setStyle('-fx-font-size: 14px; -fx-font-weight: bold;')
+    title.setStyle('-fx-font-size: 15px; -fx-font-weight: bold;')
     def center = new javafx.scene.layout.VBox(10)
     center.setPadding(new javafx.geometry.Insets(14))
     center.getChildren().add(title)
@@ -425,27 +522,39 @@ render = { ->
     }
     def addWarnLabel = { String txt ->
         def lbl = new javafx.scene.control.Label(txt); lbl.setWrapText(true); lbl.setMaxWidth(Double.MAX_VALUE)
-        lbl.setStyle('-fx-text-fill: #b8860b; -fx-font-weight: bold;'); center.getChildren().add(lbl)
+        lbl.setStyle('-fx-text-fill: #b85c00; -fx-font-weight: bold;'); center.getChildren().add(lbl)
     }
     def addLiveLog = { -> def la = logAreaRef.get(); if (la != null) { javafx.scene.layout.VBox.setVgrow(la, javafx.scene.layout.Priority.ALWAYS); center.getChildren().add(la) } }
 
     if (cur == 'CONFIG_INCOMPLETE') {
-        title.setText('Configuration required')
+        title.setText('First-Time Setup Required')
         def miss = configMissing(cfg)
-        addGuidance('This wizard needs a local hepatocyte-app checkout with its Python venv and the model checkpoint. ' +
-            'Set them below (Configure), or in Extensions → Hepatocyte → Settings…\n\nMissing / invalid:\n  • ' + (miss.isEmpty() ? '(none)' : miss.join('\n  • ')))
+        addGuidance('Point the wizard at your local hepatocyte-app folder (or configure the 3 paths individually).\n\nMissing / invalid:\n  • ' + (miss.isEmpty() ? '(none)' : miss.join('\n  • ')))
+
+        def quickBox = new javafx.scene.layout.HBox(10,
+            navButton('📁 Select hepatocyte-app folder (auto-fill)…', { pickRepoFolder() }, 'Pick your hepatocyte-app folder to auto-fill Python, bridge, and model paths'),
+            navButton('⬇ Download bridge from GitHub', { downloadBridgeFromGitHub() }, 'Download hepatocyte_qupath_inference.py from GitHub without git')
+        )
+        center.getChildren().add(quickBox)
+
         def resArea = new javafx.scene.control.TextArea(
-            'WHAT · WHERE:\n' +
-            '① Python venv : ' + (cfg.python?.trim() ? (cfg.python + '  (set)') : '(unset) — <repo>/venv/Scripts/python.exe') + '\n' +
-            '② Bridge      : ' + (cfg.bridge?.trim() ? (cfg.bridge + '  (set)') : '(unset) — <repo>/qupath/hepatocyte_qupath_inference.py') + '\n' +
-            '③ Model (.pth): ' + (cfg.model?.trim() ? (cfg.model + '  (set)') : '(unset — 🔒 on request) — baseline-1-jit.pth (~180 MB)') + '\n\n' +
-            'Repo: https://github.com/sbalci/hepatocyte-app')
-        resArea.setEditable(false); resArea.setWrapText(false); resArea.setStyle(MONO); resArea.setPrefRowCount(7); resArea.setMaxHeight(160)
+            'CURRENT STATUS:\n' +
+            '① Python venv : ' + (cfg.python?.trim() && new File(cfg.python).isFile() ? ('✅ ' + cfg.python) : '⚠ (not set) — e.g. <repo>/venv/Scripts/python.exe') + '\n' +
+            '② Bridge (.py): ' + (cfg.bridge?.trim() && new File(cfg.bridge).isFile() ? ('✅ ' + cfg.bridge) : '⚠ (not set) — <repo>/qupath/hepatocyte_qupath_inference.py') + '\n' +
+            '③ Model (.pth): ' + (cfg.model?.trim()  && new File(cfg.model).isFile()  ? ('✅ ' + cfg.model)  : '⚠ (not set — 🔒 on request) — baseline-1-jit.pth (~180 MB)') + '\n\n' +
+            'Repository: https://github.com/sbalci/hepatocyte-app')
+        resArea.setEditable(false); resArea.setWrapText(false); resArea.setStyle(MONO); resArea.setPrefRowCount(7); resArea.setMaxHeight(165)
         center.getChildren().add(resArea)
         actions.add(navButton('Close', { stage.close() }))
-        actions.add(navButton('Configure ▶', { step.set('CONFIG'); render() }))
+        actions.add(navButton('Configure paths manually ▶', { step.set('CONFIG'); render() }))
     } else if (cur == 'CONFIG') {
-        title.setText('Hepatocyte configuration')
+        title.setText('Hepatocyte Configuration')
+        def quickBox = new javafx.scene.layout.HBox(10,
+            navButton('📁 Select hepatocyte-app folder (auto-fill)…', { pickRepoFolder() }),
+            navButton('⬇ Download bridge from GitHub', { downloadBridgeFromGitHub() })
+        )
+        center.getChildren().add(quickBox)
+
         def grid = new javafx.scene.layout.GridPane(); grid.setHgap(8); grid.setVgap(8)
         def pyField = new javafx.scene.control.TextField(cfg.python ?: '')
         def brField = new javafx.scene.control.TextField(cfg.bridge ?: '')
@@ -463,77 +572,81 @@ render = { ->
         patchFieldRef.set(psField); minAreaFieldRef.set(maField); minRoiFieldRef.set(mrField); mppFieldRef.set(mpField)
         def browseFile = { f, cap -> def x = qupath.fx.dialogs.FileChoosers.promptForFile(stage, cap); if (x != null) f.setText(x.getAbsolutePath()) }
         int row = 0
-        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Python (python.exe):'), pyField, navButton('…', { browseFile(pyField, 'Pick python.exe') }))
-        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Bridge (hepatocyte_qupath_inference.py):'), brField, navButton('…', { browseFile(brField, 'Pick bridge script') }))
-        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Model (.pth — 🔒):'), mdField, navButton('…', { browseFile(mdField, 'Pick model weights') }))
+        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Python (python.exe):'), pyField, navButton('Browse…', { browseFile(pyField, 'Select python.exe') }))
+        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Bridge (hepatocyte_qupath_inference.py):'), brField, navButton('Browse…', { browseFile(brField, 'Select bridge script') }))
+        qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Model (.pth — 🔒):'), mdField, navButton('Browse…', { browseFile(mdField, 'Select model weights (.pth)') }))
         qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Device:'), deviceChoice)
         qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Patch size (px):'), psField)
         qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Min polygon area (px²):'), maField)
         qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Min ROI side (px):'), mrField)
         qupath.fx.utils.GridPaneUtils.addGridRow(grid, row++, 0, null, new javafx.scene.control.Label('Target MPP (µm/px):'), mpField)
         center.getChildren().add(grid)
-        addGuidance('Patch 512, min ROI 512 (one patch), target MPP 0.25 = model training scale. ' +
-            'Device "auto": CUDA if a GPU is present, else CPU (slower). Model is 🔒 on request.')
+        addGuidance('Defaults: Patch 512 px, Min ROI 512 px (1 patch), Target MPP 0.25 µm/px (40× scale; 20× slides are rescaled automatically). Device "auto" uses NVIDIA CUDA GPU when available.')
         actions.add(navButton('Cancel', { step.set(configComplete(cfg) ? 'READY' : 'CONFIG_INCOMPLETE'); render() }))
-        actions.add(navButton('Dependency check', { startSelftest() }, 'python -c import + model load check'))
+        actions.add(navButton('✓ Check Environment', { startSelftest() }, 'Verify Python packages and TorchScript model loading'))
         actions.add(navButton('Save ▶', { persistFields(); step.set(configComplete(loadConfig()) ? 'READY' : 'CONFIG_INCOMPLETE'); render() }))
     } else if (cur == 'CHECK_RUNNING') {
-        title.setText('Dependency check running…')
+        title.setText('Environment check running…')
         center.getChildren().add(busyBar()); addLiveLog()
         actions.add(navButton('Cancel', { cancelledRef.set(true); try { processRef.get()?.destroyForcibly() } catch (Throwable ignore) {} }))
     } else if (cur == 'CHECK_DONE') {
-        title.setText(selftestOkRef.get() ? 'Dependency check OK ✅' : '⚠ Dependency check FAILED — see the log above (Python / packages / model)')
+        title.setText(selftestOkRef.get() ? 'Environment check passed ✅' : '⚠ Environment check FAILED — see log below')
         addLiveLog()
         actions.add(navButton('◀ Back to configuration', { step.set('CONFIG'); render() }))
+        if (selftestOkRef.get() && configComplete(loadConfig())) {
+            actions.add(navButton('Continue ▶', { step.set('READY'); render() }))
+        }
         actions.add(navButton('Close', { stage.close() }))
     } else if (cur == 'READY') {
         if (imageData == null) {
-            title.setText('No image open')
-            addGuidance('Open a local liver H&E slide and draw area annotation(s) for the region(s) you want segmented, then press "⟳ Refresh".')
+            title.setText('No slide open')
+            addGuidance('Open a local liver H&E slide in QuPath and draw an area annotation (or run "4. Auto-detect tissue"), then click "⟳ Refresh".')
             actions.add(navButton('Close', { stage.close() }))
-            actions.add(navButton('Configure', { step.set('CONFIG'); render() }))
+            actions.add(navButton('Configure…', { step.set('CONFIG'); render() }))
             actions.add(navButton('⟳ Refresh', { render() }))
         } else {
             def slidePath = resolveSlidePath(imageData)
             def anns = targetAnnotations(imageData)
             int minRoi = parseIntOr(cfg.minRoi, 512)
             int usable = anns.count { def r = it.getROI(); (int) Math.ceil(r.getBoundsWidth()) >= minRoi && (int) Math.ceil(r.getBoundsHeight()) >= minRoi }
-            title.setText('Hepatocyte segmentation — ready')
+            title.setText('Hepatocyte Segmentation — Ready')
             def sb = new StringBuilder()
-            sb << "Slide           : " << imageNameOf(imageData) << "\n"
-            sb << "Slide path      : " << (slidePath ?: '(not a local file — openslide cannot open it)') << "\n"
-            sb << "Python          : " << (cfg.python ?: '(unset)') << "\n"
-            sb << "Model           : " << (cfg.model ?: '(unset — 🔒 on request)') << "\n"
-            sb << "Device          : " << cfg.device << "\n"
-            sb << String.format(java.util.Locale.US, "Area annotations: %,d   ·   usable (≥%d px): %,d%n", anns.size(), minRoi, usable)
+            sb << "Slide                 : " << imageNameOf(imageData) << "\n"
+            sb << "Slide path            : " << (slidePath ?: '(not a local file — openslide cannot open it)') << "\n"
+            sb << "Python                : " << (cfg.python ?: '(unset)') << "\n"
+            sb << "Model                 : " << (cfg.model ?: '(unset — 🔒 on request)') << "\n"
+            sb << "Device                : " << cfg.device << "\n"
+            sb << String.format(java.util.Locale.US, "Candidate annotations : %,d   ·   usable (≥%d×%d px): %,d%n", anns.size(), minRoi, minRoi, usable)
             addMonoArea(sb.toString())
-            addGuidance('Selected area annotations are processed (all area annotations if none selected). The model is its own trained TorchScript model; prediction only.')
-            if (slidePath == null) addWarnLabel('⚠ The slide is not a local file — Python (openslide) cannot open it. Open a local SVS/TIFF.')
+            addGuidance('Selected area annotations are processed (or all non-prediction area annotations if none is selected). Output is classified cell polygons + per-class counts.')
+            if (slidePath == null) addWarnLabel('⚠ The slide is not a local file — Python (openslide) cannot open remote/OMERO slides. Open a local SVS/TIFF slide.')
+            if (usable == 0) addWarnLabel('⚠ Draw at least one area annotation ≥ ' + minRoi + '×' + minRoi + ' px (Rectangle, Polygon, or Wand), or run "4. Auto-detect tissue (current slide)", then click "⟳ Refresh".')
             boolean canRun = configComplete(cfg) && (slidePath != null) && usable >= 1
             actions.add(navButton('Close', { stage.close() }))
-            actions.add(navButton('Configure', { step.set('CONFIG'); render() }))
+            actions.add(navButton('Configure…', { step.set('CONFIG'); render() }))
             actions.add(navButton('⟳ Refresh', { render() }))
-            def runBtn = navButton('Segment ▶', { startRun() }, 'Run the hepatocyte model on the selected/drawn area annotations')
+            def runBtn = navButton('Segment ▶', { startRun() }, 'Run the hepatocyte segmentation model on the candidate area annotations')
             runBtn.setDisable(!canRun)
             actions.add(runBtn)
         }
     } else if (cur == 'RUN_RUNNING') {
         title.setText(runPhaseRef.get())
-        addGuidance('The Python bridge is running (opens the slide with openslide, runs the model). Output streams below. Timeout: ' + PYTHON_TIMEOUT_SECONDS + ' s.')
+        addGuidance('The Python bridge is running (opens slide with openslide, runs TorchScript model + Watershed separation). Live progress streams below.')
         center.getChildren().add(busyBar()); addLiveLog()
         actions.add(navButton('Cancel', { cancelledRef.set(true); try { processRef.get()?.destroyForcibly() } catch (Throwable ignore) {} }))
     } else if (cur == 'BUSY') {
         title.setText(busyLabelRef.get()); addGuidance('Please wait…'); center.getChildren().add(busyBar())
     } else if (cur == 'RESULT') {
-        title.setText('Done ✅')
+        title.setText('Segmentation Complete ✅')
         addMonoArea(resultTextRef.get())
         actions.add(navButton('Close', { stage.close() }))
-        actions.add(navButton('Copy', { copyToClipboard(resultTextRef.get()) }))
-        actions.add(navButton('↻ Run again', { step.set('READY'); render() }))
+        actions.add(navButton('Copy Summary', { copyToClipboard(resultTextRef.get()) }))
+        actions.add(navButton('↻ Run Again', { step.set('READY'); render() }))
     } else { // ERROR
         title.setText('Error')
         addMonoArea(errorTextRef.get())
         actions.add(navButton('◀ Back', { step.set(configComplete(loadConfig()) ? 'READY' : 'CONFIG_INCOMPLETE'); render() }))
+        actions.add(navButton('Configure…', { step.set('CONFIG'); render() }))
         actions.add(navButton('Close', { stage.close() }))
     }
 
@@ -547,7 +660,7 @@ render = { ->
     bar.setAlignment(javafx.geometry.Pos.CENTER_LEFT)
     bar.getChildren().add(topChk); bar.getChildren().add(spacer); bar.getChildren().addAll(actions)
 
-    def disclaimer = new javafx.scene.control.Label('Produces research/education measurements only; not for clinical decision-making.')
+    def disclaimer = new javafx.scene.control.Label('Produces research/education measurements only; not for clinical diagnosis.')
     disclaimer.setWrapText(true); disclaimer.setMaxWidth(Double.MAX_VALUE)
     disclaimer.setStyle('-fx-text-fill: -fx-text-base-color; -fx-opacity: 0.6; -fx-font-style: italic; -fx-padding: 4 2 4 2; -fx-font-size: 11px;')
     def bottom = new javafx.scene.layout.VBox(8, disclaimer, bar)
@@ -555,7 +668,7 @@ render = { ->
 
     def root = new javafx.scene.layout.BorderPane()
     root.setCenter(center); root.setBottom(bottom)
-    stage.setScene(new javafx.scene.Scene(root, 900, 680))
+    stage.setScene(new javafx.scene.Scene(root, 880, 640))
 }
 
 // ── Opening state ─────────────────────────────────────────────────────────────
@@ -565,7 +678,7 @@ javafx.application.Platform.runLater {
     try {
         stage = new javafx.stage.Stage()
         stage.initModality(javafx.stage.Modality.NONE)
-        stage.setTitle('Hepatocyte segmentation')
+        stage.setTitle('Hepatocyte Segmentation')
         stage.setAlwaysOnTop(alwaysTop.get())
         render()
         stage.show()

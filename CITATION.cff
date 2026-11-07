@@ -4,10 +4,11 @@ title: "QuPath Hepatocyte Extension: run the hepatocyte-app liver segmentation m
 abstract: >
   A QuPath 0.6+ extension that packages the sbalci/hepatocyte-app deep-learning
   liver H&E segmentation workflow as one-click menu entries under
-  "Extensions → Hepatocyte". It imports slides into a project and runs the
-  TorchScript segmentation model on selected area annotations via the repo's
-  Python bridge (hepatocyte_qupath_inference.py), importing predictions back as
-  classified polygons with per-class cell counts and an optional Excel report.
+  "Extensions → Hepatocyte". It supports batch slide import into a QuPath project,
+  MPP-aware tissue auto-detection (current slide or whole project), and
+  TorchScript segmentation inference on selected ROIs or across an entire project
+  via the Python bridge (hepatocyte_qupath_inference.py), importing predictions
+  back as classified cell polygons with per-class counts and Excel reports.
   The model emits five morphological classes (Balloon dystrophy, Mesenchymal,
   Non-nuclear, Normal, Steatosis); no clinical grade or score is derived.
   Research and education only.

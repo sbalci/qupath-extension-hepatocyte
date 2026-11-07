@@ -1,9 +1,9 @@
 {
     "name": "Hepatocyte extension catalog",
-    "description": "QuPath extension for the hepatocyte-app deep-learning liver H&E segmentation model — import slides and run per-ROI inference from an Extensions → Hepatocyte menu.",
+    "description": "QuPath 0.6+ extension for the hepatocyte-app deep-learning liver H&E segmentation model — slide import, MPP-aware tissue detection, and per-ROI or whole-project inference under Extensions → Hepatocyte.",
     "extensions": [{
         "name": "QuPath Hepatocyte extension",
-        "description": "Runs the sbalci/hepatocyte-app segmentation model on QuPath annotations and imports predictions back as classified polygons with per-class cell counts. Requires a local hepatocyte-app checkout (Python venv + TorchScript model, 🔒 on request); configure paths in Settings.",
+        "description": "Runs the sbalci/hepatocyte-app segmentation model on QuPath annotations and imports predictions back as classified cell polygons with per-class counts and Excel reports. Requires a local hepatocyte-app checkout (Python venv + TorchScript model, 🔒 on request); configure paths in Settings.",
         "author": "Serdar Balci",
         "homepage": "https://github.com/sbalci/qupath-extension-hepatocyte",
         "releases": [

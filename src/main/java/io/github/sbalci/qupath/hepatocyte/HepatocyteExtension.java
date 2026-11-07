@@ -13,8 +13,7 @@
  * venv, and imports the returned GeoJSON polygons back as classified
  * annotations. Point the extension at your local checkout via Settings.
  *
- * Modeled after https://github.com/qupath/qupath-extension-template and the
- * sibling qupath-extension-workshop.
+ * Modeled after https://github.com/qupath/qupath-extension-template.
  */
 package io.github.sbalci.qupath.hepatocyte;
 
@@ -30,7 +29,7 @@ import java.util.stream.Collectors;
 import java.util.zip.ZipException;
 
 import javafx.application.Platform;
-import javafx.scene.control.Menu;
+import javafx.beans.binding.Bindings;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.SeparatorMenuItem;
 
@@ -71,23 +70,15 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
     /**
      * Runnable workflow items in display order. Each maps a menu label to a
      * bundled Groovy script under {@code /scripts/}. {@code needsImage} greys
-     * the item out while no slide is open (mirrors how sibling extensions grey
-     * their items via {@code imageDataProperty().isNull()}); project-scope
-     * helpers pass {@code false} so they stay clickable with no image open.
+     * the item out while no slide is open; project-scope items pass {@code false}
+     * so they stay clickable with no image open.
      */
     private static final List<ScriptEntry> SCRIPTS = List.of(
-        new ScriptEntry("1. Import slides from folder…",         "import-slides.groovy", false),
-        new ScriptEntry("2. Run inference on selected annotations",   "run-inference.groovy", true)
-    );
-
-    /**
-     * Items prepared for a later release. Bundled with the standalone menu in
-     * the hepatocyte-app repo but not yet packaged here — shown greyed-out so
-     * users can see the roadmap without a half-wired action.
-     */
-    private static final List<String> UPCOMING = List.of(
-        "Run inference on whole project (unlabelled / tissue)",
-        "Auto-detect tissue (current slide / whole project)"
+        new ScriptEntry("1. Import slides from folder…",                       "import-slides.groovy",         false, false),
+        new ScriptEntry("2. Run inference on selected annotations…",           "run-inference.groovy",         true,  false),
+        new ScriptEntry("3. Run inference on whole project (unlabelled / tissue)…", "run-inference-project.groovy", false, true),
+        new ScriptEntry("4. Auto-detect tissue (current slide)",               "detect-tissue-slide.groovy",   true,  false),
+        new ScriptEntry("5. Auto-detect tissue (whole project)…",              "detect-tissue-project.groovy", false, false)
     );
 
     private boolean alreadyInstalled = false;
@@ -101,9 +92,18 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
         alreadyInstalled = true;
 
         try {
+            HepatocyteConfig.autoDetectIfNeeded();
+
             var menu = qupath.getMenu(MENU_PATH, true);
 
-            var header = new MenuItem("— Hepatocyte segmentation —");
+            var header = new MenuItem();
+            header.textProperty().bind(Bindings.createStringBinding(
+                () -> (qupath.getImageData() == null && qupath.getProject() == null)
+                    ? "⚠ Open a project or slide first (File → Project / Open)"
+                    : "— Hepatocyte Segmentation —",
+                qupath.imageDataProperty(),
+                qupath.projectProperty()
+            ));
             header.setDisable(true);
             menu.getItems().add(header);
             menu.getItems().add(new SeparatorMenuItem());
@@ -115,17 +115,9 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
                     item.disableProperty().bind(qupath.imageDataProperty().isNull());
                 }
                 menu.getItems().add(item);
-            }
-
-            if (!UPCOMING.isEmpty()) {
-                menu.getItems().add(new SeparatorMenuItem());
-                Menu upcomingMenu = new Menu("Coming in a later release");
-                for (String label : UPCOMING) {
-                    MenuItem item = new MenuItem(label);
-                    item.setDisable(true);
-                    upcomingMenu.getItems().add(item);
+                if (entry.separatorAfter) {
+                    menu.getItems().add(new SeparatorMenuItem());
                 }
-                menu.getItems().add(upcomingMenu);
             }
 
             menu.getItems().add(new SeparatorMenuItem());
@@ -144,8 +136,7 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
             about.setOnAction(e -> showAboutDialog());
             menu.getItems().add(about);
 
-            logger.info("Hepatocyte extension installed with {} runnable + {} upcoming (disabled) items.",
-                    SCRIPTS.size(), UPCOMING.size());
+            logger.info("Hepatocyte extension installed with {} workflow items.", SCRIPTS.size());
         } catch (Exception ex) {
             logger.error("Failed to install Hepatocyte extension menu", ex);
         }
@@ -187,9 +178,6 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
             try {
                 Binding binding = new Binding();
                 binding.setVariable("EXTENSION_NAME", "qupath-extension-hepatocyte");
-                // Use the EXTENSION's classloader (a child of QuPath's, so it still
-                // resolves all qupath.* classes) so a running script can reach sibling
-                // bundled resources under /scripts/ via this class's getResource(...).
                 GroovyShell shell = new GroovyShell(HepatocyteExtension.class.getClassLoader(), binding);
                 shell.evaluate(scriptBody, entry.resource);
             } catch (Throwable t) {
@@ -218,10 +206,6 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
                 return reader.lines().collect(Collectors.joining("\n"));
             }
         } catch (UncheckedIOException ex) {
-            // BufferedReader.lines() wraps IOException as UncheckedIOException.
-            // ZipException here almost always means the JAR was replaced on disk
-            // while QuPath had it open — the stale central directory points at
-            // offsets that no longer contain valid local file headers.
             Throwable cause = ex.getCause();
             if (cause instanceof ZipException) {
                 logger.error("JAR corruption reading {} — likely JAR replaced while QuPath running", path, ex);
@@ -261,63 +245,62 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
     /**
      * Diagnostic dialog: reports the running QuPath version, image/project
      * state, and whether the configured python / bridge / model paths resolve
-     * to existing files — so a user can see at a glance what still needs
-     * configuring before "Run inference" will work.
+     * to existing files.
      */
     private void showEnvironmentCheck(QuPathGUI qupath) {
+        HepatocyteConfig.autoDetectIfNeeded();
         String ok = "✅ found";
-        String missing = "—  not set / missing";
+        String missing = "⚠ not set / missing";
         boolean hasImage = qupath.getImageData() != null;
         boolean hasProject = qupath.getProject() != null;
         String python = HepatocyteConfig.get(HepatocyteConfig.KEY_PYTHON);
         String bridge = HepatocyteConfig.get(HepatocyteConfig.KEY_BRIDGE);
         String model = HepatocyteConfig.get(HepatocyteConfig.KEY_MODEL);
-        boolean pyOk = isFile(python);
-        boolean brOk = isFile(bridge);
-        boolean mdOk = isFile(model);
+        boolean pyOk = HepatocyteConfig.isFile(python);
+        boolean brOk = HepatocyteConfig.isFile(bridge);
+        boolean mdOk = HepatocyteConfig.isFile(model);
         Dialogs.showMessageDialog(
-            "Hepatocyte — Environment check",
+            "Hepatocyte — Environment Check",
             "QuPath version:    " + GeneralTools.getVersion() + "\n"
             + "Extension:         v" + EXTENSION_VERSION + "  (built " + BUILD_TIMESTAMP + ")\n"
             + "QuPath baseline:   " + QUPATH_BASELINE + "+\n\n"
-            + "Open image:        " + (hasImage ? "yes" : "no — use File → Open") + "\n"
+            + "Open slide:        " + (hasImage ? "yes" : "no — open a slide via Project tab or File → Open") + "\n"
             + "Open project:      " + (hasProject ? "yes" : "no") + "\n\n"
             + "Inference configuration (Settings…):\n"
-            + "  • Python (venv):        " + (pyOk ? ok : missing) + "\n"
-            + "  • Bridge (inference.py): " + (brOk ? ok : missing) + "\n"
-            + "  • Model checkpoint:     " + (mdOk ? ok : missing) + "\n\n"
+            + "  • Python (venv):         " + (pyOk ? ok + " (" + python + ")" : missing) + "\n"
+            + "  • Bridge (inference.py): " + (brOk ? ok + " (" + bridge + ")" : missing) + "\n"
+            + "  • Model checkpoint:      " + (mdOk ? ok + " (" + model + ")" : missing) + "\n\n"
             + (HepatocyteConfig.isComplete()
-                ? "All three inference paths resolve — you're ready to run inference.\n"
-                : "Set the missing paths in Extensions → Hepatocyte → Settings…\n"
-                  + "You need a local checkout of https://github.com/sbalci/hepatocyte-app\n"
-                  + "with its Python venv, and the TorchScript model (🔒 on request).\n")
-            + "\nFor research and education only."
+                ? "✅ All three required paths resolve on disk — you are ready to run inference.\n"
+                : "Set the missing path(s) in Extensions → Hepatocyte → Settings…\n"
+                  + "(Click 'Select hepatocyte-app folder' in Settings to auto-fill all three paths.)\n")
+            + "\nFor research and education use only."
         );
-    }
-
-    private static boolean isFile(String path) {
-        return path != null && !path.isBlank() && new java.io.File(path).isFile();
     }
 
     private void showAboutDialog() {
         Dialogs.showMessageDialog(
             "QuPath Hepatocyte Extension",
             "Runs the hepatocyte-app deep-learning liver H&E segmentation model on\n"
-            + "QuPath annotations, importing predictions back as classified polygons.\n\n"
-            + "Menu items:\n"
-            + "  1 — Import slides from folder (recursive .svs → project, set H&E)\n"
-            + "  2 — Run inference on selected annotations (per-ROI model round-trip)\n\n"
-            + "The model runs OUTSIDE QuPath via the repo's Python bridge. Point the\n"
-            + "extension at your local checkout in Settings… (Python venv, inference\n"
-            + "script, model checkpoint). The model emits five morphological classes:\n"
-            + "Balloon dystrophy, Mesenchymal, Non-nuclear, Normal, Steatosis.\n\n"
-            + "Version:        " + EXTENSION_VERSION + "\n"
-            + "Build date:     " + BUILD_TIMESTAMP + "\n"
+            + "QuPath annotations, importing predictions back as classified cell polygons\n"
+            + "with per-class counts and optional Excel morphometry reports.\n\n"
+            + "Workflow menu items:\n"
+            + "  1 — Import slides from folder (recursively add WSI files + set H&E)\n"
+            + "  2 — Run inference on selected annotations (interactive wizard)\n"
+            + "  3 — Run inference on whole project (batch across unlabelled / Tissue ROIs)\n"
+            + "  4 — Auto-detect tissue (current slide, MPP-aware)\n"
+            + "  5 — Auto-detect tissue (whole project, MPP-aware)\n\n"
+            + "Morphological classes emitted by the model:\n"
+            + "  • Balloon dystrophy   • Mesenchymal   • Non-nuclear\n"
+            + "  • Normal              • Steatosis\n\n"
+            + "Version:         " + EXTENSION_VERSION + "\n"
+            + "Build date:      " + BUILD_TIMESTAMP + "\n"
             + "QuPath baseline: " + QUPATH_BASELINE + "+\n\n"
             + "🌐 Repository: https://github.com/sbalci/hepatocyte-app\n"
+            + "📦 Extension:  https://github.com/sbalci/qupath-extension-hepatocyte\n"
             + "✉️  Contact:    drserdarbalci@gmail.com\n\n"
-            + "For research and education only. Not for clinical decision-making.\n"
-            + "Output is a deep-learning prediction — verify visually."
+            + "For research and education only — not for clinical diagnosis.\n"
+            + "Output is a deep-learning prediction; always verify visually."
         );
     }
 
@@ -330,8 +313,8 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
 
     @Override
     public String getDescription() {
-        return "Run the hepatocyte-app liver segmentation model on QuPath annotations "
-             + "(import slides, per-ROI inference, per-class counts).";
+        return "Run the hepatocyte-app liver H&E segmentation model on QuPath annotations "
+             + "(import slides, tissue auto-detection, per-ROI and whole-project inference).";
     }
 
     @Override
@@ -345,9 +328,6 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
     }
 
     // --- GitHubProject contract ----------------------------------------------
-    // Lets QuPath check GitHub Releases and notify the user when a newer version
-    // is available. NOTE: this is the extension's OWN repo — unrelated to
-    // getQuPathVersion()'s 0.6.0 baseline.
 
     @Override
     public GitHubProject.GitHubRepo getRepository() {
@@ -359,13 +339,14 @@ public class HepatocyteExtension implements QuPathExtension, GitHubProject {
     private static final class ScriptEntry {
         final String label;
         final String resource;
-        /** When true the item greys out while no image is open. */
         final boolean needsImage;
+        final boolean separatorAfter;
 
-        ScriptEntry(String label, String resource, boolean needsImage) {
+        ScriptEntry(String label, String resource, boolean needsImage, boolean separatorAfter) {
             this.label = label;
             this.resource = resource;
             this.needsImage = needsImage;
+            this.separatorAfter = separatorAfter;
         }
     }
 }
